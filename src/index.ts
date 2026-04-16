@@ -161,6 +161,43 @@ async function appendToMarkdown(
   await writeFile(filepath, existing + append, 'utf8');
 }
 
+async function saveAllMarkdown(
+  cwd: string,
+  results: Array<{ topic: string; result: GrillMeResult }>,
+): Promise<string> {
+  const sessionsDir = await ensureGrillSessionsDir(cwd);
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const filepath = join(sessionsDir, `${ts}-all-categories.md`);
+
+  let md = `# Full Grill Session — All Categories\n\n`;
+  md += `**Date:** ${new Date().toISOString()}\n`;
+  md += `**Categories:** ${results.length}\n\n---\n\n`;
+
+  for (const { topic, result } of results) {
+    md += `# ${topic}\n\n`;
+    md += `**Status:** ${result.completed ? 'Complete' : 'Incomplete'}\n`;
+    md += `**Rounds:** ${result.sessions.length}\n\n`;
+    if (result.summary) {
+      md += `**Summary:** ${result.summary}\n\n`;
+    }
+    md += `---\n\n`;
+
+    result.sessions.forEach((session) => {
+      md += `## Round ${session.round}\n\n`;
+      md += `*${session.timestamp}*\n\n`;
+      session.questions.forEach((q, i) => {
+        const a = session.answers[i];
+        const answerText = a ? formatAnswerValueForMarkdown(a) : '(no answer)';
+        md += `**Q: ${q.prompt}**\n\nA: ${answerText}\n\n`;
+      });
+    });
+    md += `\n---\n\n`;
+  }
+
+  await writeFile(filepath, md, 'utf8');
+  return filepath;
+}
+
 function formatAnswerValueForMarkdown(answer: NormalizedAnswer): string {
   const listed = answer.selectedOptions.map((o) => o.label).join(', ');
   const other = answer.otherText ? `Other: "${answer.otherText}"` : '';
@@ -384,7 +421,10 @@ const TOPIC_SUGGESTIONS = [
   'Auth flow',
   'Deployment strategy',
   'Microservices boundaries',
+  'All',
 ];
+
+const TOPIC_CATEGORIES = TOPIC_SUGGESTIONS.filter(t => t !== 'All');
 
 // ─── Extension entry ────────────────────────────────────────────────────
 
@@ -427,12 +467,57 @@ export default function grillMeTuiExtension(pi: ExtensionAPI) {
           ctx.ui.notify('Cancelled.', 'info');
           return;
         }
-        topic = choice;
 
-        const roundsInput = await ctx.ui.input('Max rounds? (default: 3)');
+        const roundsInput = await ctx.ui.input('Max rounds per topic? (default: 3)');
         if (roundsInput && /^\d+$/.test(roundsInput.trim())) {
           maxRounds = Math.max(1, Math.min(10, parseInt(roundsInput.trim(), 10)));
         }
+
+        if (choice === 'All') {
+          // Run all topics sequentially
+          ctx.ui.notify(`Grilling all ${TOPIC_CATEGORIES.length} categories, ${maxRounds} rounds each...`, 'info');
+          const allResults: Array<{ topic: string; result: GrillMeResult }> = [];
+          for (const cat of TOPIC_CATEGORIES) {
+            ctx.ui.setStatus('grill-me', ctx.ui.theme.fg('accent', `🔥 ${cat} [${allResults.length + 1}/${TOPIC_CATEGORIES.length}]`));
+            try {
+              const result = await runGrillFlow({ ctx, topic: cat, maxRounds });
+              allResults.push({ topic: cat, result });
+            } catch (err: any) {
+              ctx.ui.notify(`${cat}: ${err.message}`, 'error');
+              allResults.push({ topic: cat, result: { sessions: [], summary: `Failed: ${err.message}`, completed: false, cancelled: false } });
+            }
+          }
+          ctx.ui.setStatus('grill-me', undefined);
+
+          // Save master summary
+          const masterPath = await saveAllMarkdown(ctx.cwd, allResults);
+          const completed = allResults.filter(r => r.result.completed).length;
+          const totalSessions = allResults.reduce((sum, r) => sum + r.result.sessions.length, 0);
+          ctx.ui.notify(
+            `All done! ${completed}/${TOPIC_CATEGORIES.length} completed, ${totalSessions} total rounds.\nMaster summary: ${masterPath}`,
+            'success',
+          );
+
+          // Save master bead
+          const beadsAvailable = await hasBeadsDb(ctx.cwd);
+          if (beadsAvailable) {
+            const masterDesc = allResults.map(r =>
+              `## ${r.topic}\n\n${r.result.summary || 'No summary'}`
+            ).join('\n\n');
+            const masterBeadId = await createGrillBead(
+              ctx.cwd,
+              'All categories grill session',
+              masterDesc,
+              `${completed}/${TOPIC_CATEGORIES.length} categories completed, ${totalSessions} rounds total`,
+            );
+            if (masterBeadId) {
+              ctx.ui.notify(`Master bead: ${masterBeadId}`, 'success');
+            }
+          }
+          return;
+        }
+
+        topic = choice;
       } else {
         // Check if args ends with a number
         const parts = topic.split(/\s+/);
