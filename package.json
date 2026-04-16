@@ -1,0 +1,17 @@
+{
+  "name": "grill-me-tui",
+  "version": "1.0.0",
+  "description": "Interactive grill-me questionnaire extension for pi. Renders LLM-generated design questions via TUI, persists answers to beads and markdown.",
+  "main": "src/index.ts",
+  "scripts": {
+    "test": "echo \"No tests yet\" && exit 0"
+  },
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.38",
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-tui": "*"
+  }
+}
