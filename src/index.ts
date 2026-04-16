@@ -9,7 +9,6 @@
  */
 
 import type { ExtensionAPI } from '@mariozechner/pi-coding-agent';
-import { Key, matchesKey, truncateToWidth } from '@mariozechner/pi-tui';
 import { complete, type UserMessage } from '@mariozechner/pi-ai';
 import { mkdir, writeFile, readFile, access } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -372,94 +371,20 @@ async function runGrillFlow({ ctx, topic, maxRounds }: GrillOrchestratorOptions)
   return { sessions, summary, completed: true, cancelled: false };
 }
 
-// ─── TUI for topic selection ────────────────────────────────────────────
+// ─── Topic selection using built-in UI ──────────────────────────────────
 
-class TopicDialog {
-  private inputText = '';
-  private roundsText = '3';
-  private focusedField: 'topic' | 'rounds' = 'topic';
-  private cachedWidth?: number;
-  private cachedLines?: string[];
-
-  constructor(
-    private tui: any,
-    private theme: any,
-    private done: (result: { topic: string; rounds: number } | null) => void,
-  ) {}
-
-  handleInput(data: string) {
-    if (matchesKey(data, Key.escape)) {
-      this.done(null);
-      return;
-    }
-
-    if (matchesKey(data, Key.enter)) {
-      if (this.inputText.trim()) {
-        const rounds = Math.max(1, Math.min(10, parseInt(this.roundsText, 10) || 3));
-        this.done({ topic: this.inputText.trim(), rounds });
-      }
-      return;
-    }
-
-    if (matchesKey(data, Key.tab)) {
-      this.focusedField = this.focusedField === 'topic' ? 'rounds' : 'topic';
-      this.invalidate();
-      return;
-    }
-
-    if (this.focusedField === 'topic') {
-      if (matchesKey(data, Key.backspace)) {
-        this.inputText = this.inputText.slice(0, -1);
-      } else if (data.length === 1 && data.charCodeAt(0) >= 32) {
-        this.inputText += data;
-      }
-    } else {
-      if (matchesKey(data, Key.backspace)) {
-        this.roundsText = this.roundsText.slice(0, -1);
-      } else if (data >= '0' && data <= '9') {
-        if (this.roundsText.length < 2) this.roundsText += data;
-      }
-    }
-    this.invalidate();
-  }
-
-  render(width: number): string[] {
-    if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
-
-    const lines: string[] = [];
-    const add = (s: string) => lines.push(truncateToWidth(s, width));
-
-    add(this.theme.fg('accent', '─'.repeat(width)));
-    add('');
-    add(this.theme.fg('accent', this.theme.bold('🔥 Grill Me')));
-    add('');
-
-    const topicPrefix = this.focusedField === 'topic'
-      ? this.theme.fg('accent', '▸ ')
-      : '  ';
-    const topicCursor = this.focusedField === 'topic' ? '█' : '';
-    add(`${topicPrefix}Topic: ${this.theme.fg('text', this.inputText)}${topicCursor}`);
-    add('');
-
-    const roundsPrefix = this.focusedField === 'rounds'
-      ? this.theme.fg('accent', '▸ ')
-      : '  ';
-    const roundsCursor = this.focusedField === 'rounds' ? '█' : '';
-    add(`${roundsPrefix}Max rounds: ${this.theme.fg('text', this.roundsText)}${roundsCursor}`);
-    add('');
-    add(this.theme.fg('dim', 'Tab switch fields • Enter start • Esc cancel'));
-    add(this.theme.fg('accent', '─'.repeat(width)));
-
-    this.cachedWidth = width;
-    this.cachedLines = lines;
-    return lines;
-  }
-
-  invalidate() {
-    this.cachedWidth = undefined;
-    this.cachedLines = undefined;
-  }
-}
+const TOPIC_SUGGESTIONS = [
+  'Architecture review',
+  'API design',
+  'Data model',
+  'Security review',
+  'Performance',
+  'Testing strategy',
+  'State management',
+  'Auth flow',
+  'Deployment strategy',
+  'Microservices boundaries',
+];
 
 // ─── Extension entry ────────────────────────────────────────────────────
 
@@ -496,22 +421,18 @@ export default function grillMeTuiExtension(pi: ExtensionAPI) {
       let maxRounds = 3;
 
       if (!topic) {
-        // Show topic selector dialog
-        const result: { topic: string; rounds: number } | null = await ctx.ui.custom(
-          (tui, theme, _kb, done) => {
-            const dialog = new TopicDialog(tui, theme, done);
-            return {
-              render: (w) => dialog.render(w),
-              handleInput: (data) => dialog.handleInput(data),
-              invalidate: () => dialog.invalidate(),
-            };
-          },
-          { overlay: true },
-        );
+        // Show topic selector using built-in UI
+        const choice = await ctx.ui.select('🔥 What do you want to grill?', TOPIC_SUGGESTIONS);
+        if (!choice) {
+          ctx.ui.notify('Cancelled.', 'info');
+          return;
+        }
+        topic = choice;
 
-        if (!result) return;
-        topic = result.topic;
-        maxRounds = result.rounds;
+        const roundsInput = await ctx.ui.input('Max rounds? (default: 3)');
+        if (roundsInput && /^\d+$/.test(roundsInput.trim())) {
+          maxRounds = Math.max(1, Math.min(10, parseInt(roundsInput.trim(), 10)));
+        }
       } else {
         // Check if args ends with a number
         const parts = topic.split(/\s+/);
