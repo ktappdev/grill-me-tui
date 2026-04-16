@@ -29,6 +29,34 @@ import type {
 } from './types.js';
 import { runQuestionnaireUI } from './ui.js';
 
+type GrillContext = any;
+
+// Mutex for markdown file writes
+const writeLocks = new Map<string, Promise<void>>();
+
+// Sanitize topic for safe shell usage
+function sanitizeTopic(topic: string): string {
+  return topic.replace(/[^a-zA-Z0-9 _-]/g, '').trim().slice(0, 100);
+}
+
+// Parse LLM JSON with retry
+async function parseLLMJson(text: string, maxRetries: number = 2): Promise<any> {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const clean = text.replace(/```[\s\S]*?\n|```/g, '');
+      const start = clean.indexOf('{');
+      const end = clean.lastIndexOf('}');
+      if (start === -1 || end === -1 || end <= start) throw new Error('No JSON object found');
+      return JSON.parse(clean.slice(start, end + 1));
+    } catch (err) {
+      if (attempt === maxRetries) {
+        throw new Error(`JSON parse failed after ${maxRetries} retries. Response: ${text.slice(0, 200)}`);
+      }
+      await new Promise(r => setTimeout(r, 100 * Math.pow(2, attempt)));
+    }
+  }
+}
+
 // ─── System prompt for question generation ──────────────────────────────
 
 const GRILL_SYSTEM_PROMPT = `You are a ruthless design interviewer. Your job is to stress-test a design plan by asking sharp, specific questions that expose ambiguities, hidden assumptions, and unresolved dependencies.
@@ -88,14 +116,21 @@ async function createGrillBead(
   description: string,
   summary: string,
 ): Promise<string | null> {
+  const safeTopic = sanitizeTopic(topic);
+  if (!safeTopic) {
+    return null;
+  }
+
+  const safeSummary = summary.slice(0, 1000);
+  const safeDesc = description.slice(0, 5000);
   const result = await runBd(
     [
       'create',
       '--type', 'task',
       '-l', 'grill-me,design-review',
-      '-d', summary,
-      '--notes', description,
-      `Grill session: ${topic}`,
+      '-d', safeSummary,
+      '--notes', safeDesc,
+      `Grill session: ${safeTopic}`,
     ],
     cwd,
   );
@@ -108,7 +143,8 @@ async function createGrillBead(
 }
 
 async function addNoteToBead(cwd: string, beadId: string, note: string): Promise<boolean> {
-  const result = await runBd(['note', beadId, note], cwd);
+  const safeNote = note.slice(0, 5000);
+  const result = await runBd(['note', beadId, safeNote], cwd);
   return result.exitCode === 0;
 }
 
@@ -131,14 +167,25 @@ async function saveToMarkdown(
   summary: string,
 ): Promise<string> {
   const sessionsDir = await ensureGrillSessionsDir(cwd);
-  const slug = topic.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 50);
-  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-  const filename = `${ts}-${slug}.md`;
+  const baseSlug = topic.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 50);
+  const suffix = Math.random().toString(36).slice(2, 6);
+  const slug = baseSlug || 'grill-session';
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  const filename = `${ts}-${slug}-${suffix}.md`;
   const filepath = join(sessionsDir, filename);
 
-  const content = formatMarkdownContent(topic, sessions, summary);
-  await writeFile(filepath, content, 'utf8');
-  return filepath;
+  if (writeLocks.has(filepath)) await writeLocks.get(filepath);
+  let resolveLock: () => void;
+  const lock = new Promise<void>(resolve => { resolveLock = resolve; });
+  writeLocks.set(filepath, lock);
+  try {
+    const content = formatMarkdownContent(topic, sessions, summary);
+    await writeFile(filepath, content, 'utf8');
+    return filepath;
+  } finally {
+    writeLocks.delete(filepath);
+    resolveLock();
+  }
 }
 
 async function appendToMarkdown(
@@ -147,19 +194,41 @@ async function appendToMarkdown(
   round: number,
   session: { questions: NormalizedQuestion[]; answers: NormalizedAnswer[]; timestamp: string },
   summary: string,
-): Promise<void> {
-  const existing = await readFile(filepath, 'utf8');
-  let append = `\n## Round ${round + 1}\n\n`;
-  append += `*${session.timestamp}*\n\n`;
-  session.questions.forEach((q, i) => {
-    const answer = session.answers[i];
-    const answerText = answer ? formatAnswerValueForMarkdown(answer) : '(no answer)';
-    append += `**Q: ${q.prompt}**\n\n`;
-    append += `A: ${answerText}\n\n`;
-  });
-  append += `\n---\n\n**Summary:** ${summary}\n\n`;
+) {
+  // Wait for existing write lock on this file
+  if (writeLocks.has(filepath)) {
+    await writeLocks.get(filepath);
+  }
 
-  await writeFile(filepath, existing + append, 'utf8');
+  let resolveLock: () => void;
+  const lock = new Promise<void>(resolve => { resolveLock = resolve; });
+  writeLocks.set(filepath, lock);
+
+  try {
+    let existing = '';
+    try {
+      existing = await readFile(filepath, 'utf8');
+    } catch {
+      // File does not exist yet
+    }
+
+    let append = `\n## Round ${round + 1}\n\n`;
+    append += `*${session.timestamp}*\n\n`;
+    session.questions.forEach((q, i) => {
+      const answer = session.answers[i];
+      const answerText = answer ? formatAnswerValueForMarkdown(answer) : '(no answer)';
+      append += `**Q: ${q.prompt}**\n\n`;
+      append += `A: ${answerText}\n\n`;
+    });
+    append += `\n---\n\n**Summary:** ${summary}\n\n`;
+
+    await writeFile(filepath, existing + append, 'utf8');
+  } catch (err) {
+    console.warn('Failed to append to markdown:', err);
+  } finally {
+    writeLocks.delete(filepath);
+    resolveLock();
+  }
 }
 
 async function saveAllMarkdown(
@@ -167,8 +236,15 @@ async function saveAllMarkdown(
   results: Array<{ topic: string; result: GrillMeResult }>,
 ): Promise<string> {
   const sessionsDir = await ensureGrillSessionsDir(cwd);
-  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-  const filepath = join(sessionsDir, `${ts}-all-categories.md`);
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  const suffix = Math.random().toString(36).slice(2, 6);
+  const filepath = join(sessionsDir, `${ts}-all-categories-${suffix}.md`);
+
+  // Acquire lock
+  if (writeLocks.has(filepath)) await writeLocks.get(filepath);
+  let resolveLock: () => void;
+  const lock = new Promise<void>(resolve => { resolveLock = resolve; });
+  writeLocks.set(filepath, lock);
 
   let md = `# Full Grill Session — All Categories\n\n`;
   md += `**Date:** ${new Date().toISOString()}\n`;
@@ -195,8 +271,13 @@ async function saveAllMarkdown(
     md += `\n---\n\n`;
   }
 
-  await writeFile(filepath, md, 'utf8');
-  return filepath;
+  try {
+    await writeFile(filepath, md, 'utf8');
+    return filepath;
+  } finally {
+    writeLocks.delete(filepath);
+    resolveLock();
+  }
 }
 
 function formatAnswerValueForMarkdown(answer: NormalizedAnswer): string {
@@ -208,6 +289,13 @@ function formatAnswerValueForMarkdown(answer: NormalizedAnswer): string {
   return '—';
 }
 
+// Check if an answer is ambiguous/vague (should not be marked as resolved)
+function isAnswerAmbiguous(answer: NormalizedAnswer): boolean {
+  const text = answer.selectedOptions.map(o => o.label.toLowerCase()).join(' ') + ' ' + (answer.otherText || '').toLowerCase();
+  const vaguePatterns = ['none', 'ignore', 'undecided', 'deferred', 'unsure', 'not sure', 'maybe', 'idk', 'dont know', "don't know", 'n/a', 'na', 'unknown', 'tbd', 'skip', 'pending'];
+  return vaguePatterns.some(p => text.includes(p));
+}
+
 // ─── LLM PRD generation ─────────────────────────────────────────────────
 
 const PRD_PROMPT = `You are a technical writer. Given a project description and grill session Q&A answers, generate a structured PRD checklist in markdown.
@@ -215,9 +303,12 @@ const PRD_PROMPT = `You are a technical writer. Given a project description and 
 Rules:
 - Group related decisions into logical phases (Phase 1, Phase 2, etc.)
 - Each phase has 3-6 checkable items
-- Mark items as [x] if the Q&A resolved them, [ ] if unresolved
-- Include relative links to detailed session files where decisions were made
-- Add an "Open Questions" section for anything that wasn't decided
+- Mark items as [x] if the answer is RESOLVED (clear, actionable decision)
+- Mark items as [ ] if the answer is UNRESOLVED (vague, ambiguous, conflicting, or unclear)
+- Answers marked "AMBIGUOUS" must be [ ]. Examples: "none", "ignore", typos, contradictions.
+- Include relative links to detailed session files using the EXACT filenames provided in the "File references" section
+- Format links as: [filename](./filename.md)
+- Add an "Open Questions" section for anything that wasn't decided or is ambiguous
 - Keep it concise — this is a working checklist, not an essay
 - Use the project description as the overview
 
@@ -230,15 +321,21 @@ async function generatePRD(
   projectDesc: string,
   projectType: string,
   allResults: Array<{ topic: string; result: GrillMeResult }>,
+  fileMap: Record<string, string>,
   signal: AbortSignal,
 ): Promise<string> {
   const auth = await modelRegistry.getApiKeyAndHeaders(model);
   if (!auth.ok || !auth.apiKey) {
-    // Fallback: simple format without LLM
-    return generateSimplePRD(projectDesc, projectType, allResults);
+    return generateSimplePRD(projectDesc, projectType, allResults, fileMap);
   }
 
   let context = `Project: ${projectDesc}\nType: ${projectType}\n\n`;
+  context += `File references (use these exact filenames for links):\n`;
+  for (const [topic, filename] of Object.entries(fileMap)) {
+    context += `  ${topic} → ${filename}\n`;
+  }
+  context += '\n';
+
   allResults.forEach((r) => {
     context += `### ${r.topic}\n`;
     if (r.result.summary) context += `Summary: ${r.result.summary}\n`;
@@ -246,7 +343,8 @@ async function generatePRD(
       s.questions.forEach((q, i) => {
         const a = s.answers[i];
         const answer = a ? formatAnswerValueForMarkdown(a) : '(unresolved)';
-        context += `- Q: ${q.prompt}\n  A: ${answer}\n`;
+        const status = a && !isAnswerAmbiguous(a) ? 'RESOLVED' : 'AMBIGUOUS';
+        context += `- [${status}] Q: ${q.prompt}\n  A: ${answer}\n`;
       });
     });
     context += '\n';
@@ -266,7 +364,7 @@ async function generatePRD(
     );
 
     if (response.stopReason === 'aborted') {
-      return generateSimplePRD(projectDesc, projectType, allResults);
+      return generateSimplePRD(projectDesc, projectType, allResults, fileMap);
     }
 
     const text = response.content
@@ -276,7 +374,7 @@ async function generatePRD(
 
     return text.replace(/```(?:markdown)?\n?/g, '').trim();
   } catch {
-    return generateSimplePRD(projectDesc, projectType, allResults);
+    return generateSimplePRD(projectDesc, projectType, allResults, fileMap);
   }
 }
 
@@ -284,6 +382,7 @@ function generateSimplePRD(
   projectDesc: string,
   projectType: string,
   allResults: Array<{ topic: string; result: GrillMeResult }>,
+  fileMap: Record<string, string>,
 ): string {
   let md = `# Project: ${projectDesc}\n\n`;
   md += `**Type:** ${projectType}\n`;
@@ -292,12 +391,14 @@ function generateSimplePRD(
   md += `---\n\n`;
 
   allResults.forEach((r) => {
-    md += `## ${r.topic}\n\n`;
+    const link = fileMap[r.topic] ? ` ([${fileMap[r.topic]}](./${fileMap[r.topic]}))` : '';
+    md += `## ${r.topic}${link}\n\n`;
     r.result.sessions.forEach((s) => {
       s.questions.forEach((q, i) => {
         const a = s.answers[i];
         const answer = a ? formatAnswerValueForMarkdown(a) : '(unresolved)';
-        md += `- [ ] ${q.prompt}\n  - Answer: ${answer}\n`;
+        const status = a && !isAnswerAmbiguous(a);
+        md += `- [${status ? 'x' : ' '}] ${q.prompt}\n  - Answer: ${answer}\n`;
       });
     });
     md += `\n`;
@@ -312,28 +413,18 @@ async function generateQuestionsWithLoader(
   model: any,
   topic: string,
   previousSessions: GrillSession[],
+  signal?: AbortSignal,
 ): Promise<{ questions: QuestionInput[]; continue: boolean; summary: string } | null> {
-  return uiCtx.ui.custom<{
-    questions: QuestionInput[];
-    continue: boolean;
-    summary: string;
-  } | null>((tui, theme, _kb, done) => {
+  return uiCtx.ui.custom((tui, theme, _kb, done) => {
     const loader = new BorderedLoader(tui, theme, `Generating questions${topic ? ` — ${topic}` : ''}...`);
     loader.onAbort = () => done(null);
-
-    generateQuestions(
-      modelRegistry,
-      model,
-      topic,
-      previousSessions,
-      loader.signal,
-    )
+    const effectiveSignal = signal ?? loader.signal;
+    generateQuestions(modelRegistry, model, topic, previousSessions, effectiveSignal)
       .then((result) => done(result))
       .catch((err) => {
         loader.message = `Error: ${err.message}`;
         setTimeout(() => done(null), 500);
       });
-
     return loader;
   });
 }
@@ -390,43 +481,41 @@ async function generateQuestions(
     .map((c) => c.text)
     .join('\n');
 
-  // Strip markdown code fences if present
-  const cleanJson = text.replace(/```(?:json)?\n?/g, '').trim();
-
   try {
-    const parsed = JSON.parse(cleanJson);
+    const parsed = await parseLLMJson(text);
     return {
       questions: parsed.questions as QuestionInput[],
       continue: parsed.continue !== false,
       summary: parsed.summary || '',
     };
-  } catch {
-    throw new Error(`LLM returned invalid JSON: ${text.slice(0, 200)}`);
+  } catch (err: any) {
+    throw new Error(`LLM returned invalid response. Check API key and retry. Details: ${err.message.slice(0, 100)}`);
   }
 }
 
 // ─── Grill flow orchestrator ────────────────────────────────────────────
 
 interface GrillOrchestratorOptions {
-  ctx: any; // ExtensionContext
+  ctx: GrillContext;
   topic: string;
   maxRounds: number;
+  signal?: AbortSignal;
 }
 
-async function runGrillFlow({ ctx, topic, maxRounds }: GrillOrchestratorOptions): Promise<GrillMeResult> {
+async function runGrillFlow({ ctx, topic, maxRounds, signal }: GrillOrchestratorOptions): Promise<GrillMeResult> {
   const sessions: GrillSession[] = [];
   let markdownPath: string | null = null;
   let beadId: string | null = null;
   let summary = '';
 
   for (let round = 0; round < maxRounds; round++) {
-    // Generate questions via LLM (with spinner overlay)
     const generated = await generateQuestionsWithLoader(
       ctx,
       ctx.modelRegistry,
       ctx.model,
       topic,
       sessions,
+      signal,
     );
 
     if (!generated || !generated.questions.length) {
@@ -434,21 +523,18 @@ async function runGrillFlow({ ctx, topic, maxRounds }: GrillOrchestratorOptions)
     }
 
     const validation = validateQuestions(generated.questions);
-    if (!validation.valid) {
-      ctx.ui.notify(`LLM question validation failed: ${validation.error}`, 'warning');
+    if (validation.valid === false) {
+      ctx.ui.notify(`Question validation failed: ${validation.error}`, 'warning');
       break;
     }
 
     const questions = normalizeQuestions(generated.questions);
-
-    // Render TUI
     const uiResult = await runQuestionnaireUI(ctx, questions);
 
     if (uiResult.cancelled) {
       return { sessions, summary, completed: false, cancelled: true };
     }
 
-    // Save round
     const session: GrillSession = {
       round: round + 1,
       questions,
@@ -457,21 +543,20 @@ async function runGrillFlow({ ctx, topic, maxRounds }: GrillOrchestratorOptions)
     };
     sessions.push(session);
 
-    // Persist to beads (first round only for bead creation)
     if (round === 0) {
       const beadsAvailable = await hasBeadsDb(ctx.cwd);
       if (beadsAvailable) {
-        const desc = formatBeadDescription(topic, sessions.map(s => ({
+        const safeTopic = sanitizeTopic(topic);
+        const desc = formatBeadDescription(safeTopic, sessions.map(s => ({
           questions: s.questions,
           answers: s.answers,
         })));
-        beadId = await createGrillBead(ctx.cwd, topic, desc, generated.summary || '');
+        beadId = await createGrillBead(ctx.cwd, safeTopic, desc, generated.summary || '');
         if (beadId) {
           ctx.ui.notify(`Bead created: ${beadId}`, 'success');
         }
       }
 
-      // Always save markdown
       const fullSummary = generated.summary || sessions.map(s =>
         s.answers.map(a => `${a.questionLabel}: ${formatAnswerValueForMarkdown(a)}`).join('; ')
       ).join(' | ');
@@ -482,7 +567,7 @@ async function runGrillFlow({ ctx, topic, maxRounds }: GrillOrchestratorOptions)
         timestamp: s.timestamp,
       }));
 
-      markdownPath = await saveToMarkdown(ctx.cwd, topic, tsSessions, fullSummary);
+      markdownPath = await saveToMarkdown(ctx.cwd, sanitizeTopic(topic), tsSessions, fullSummary);
       ctx.ui.notify(`Saved: ${markdownPath}`, 'success');
     } else {
       // Append to existing markdown
@@ -519,18 +604,18 @@ async function runGrillFlow({ ctx, topic, maxRounds }: GrillOrchestratorOptions)
     }
   }
 
-  // Final bead note with full summary
   if (beadId && summary) {
-    await addNoteToBead(ctx.cwd, beadId, `FINAL SUMMARY: ${summary}`);
+    await addNoteToBead(ctx.cwd, beadId, `FINAL SUMMARY: ${summary.slice(0, 1000)}`);
   }
-
-  // Update markdown with final summary
   if (markdownPath && summary) {
     try {
-      const existing = await readFile(markdownPath, 'utf8');
-      await writeFile(markdownPath, existing + `\n## Final Summary\n\n${summary}\n`, 'utf8');
-    } catch {
-      // ignore
+      await appendToMarkdown(ctx.cwd, markdownPath, -1, {
+        questions: [],
+        answers: [],
+        timestamp: new Date().toISOString(),
+      }, `FINAL SUMMARY: ${summary.slice(0, 1000)}`);
+    } catch (err: any) {
+      ctx.ui.notify(`Failed to save final summary: ${err.message.slice(0, 100)}`, 'warning');
     }
   }
 
@@ -583,29 +668,18 @@ async function generateQuestionsWithContextWithLoader(
   projectContext: string,
   category: string,
   previousSessions: GrillSession[],
+  signal?: AbortSignal,
 ): Promise<{ questions: QuestionInput[]; continue: boolean; summary: string } | null> {
-  return uiCtx.ui.custom<{
-    questions: QuestionInput[];
-    continue: boolean;
-    summary: string;
-  } | null>((tui, theme, _kb, done) => {
+  return uiCtx.ui.custom((tui, theme, _kb, done) => {
     const loader = new BorderedLoader(tui, theme, `Generating ${category} questions...`);
     loader.onAbort = () => done(null);
-
-    generateQuestionsWithContext(
-      modelRegistry,
-      model,
-      projectContext,
-      category,
-      previousSessions,
-      loader.signal,
-    )
+    const effectiveSignal = signal ?? loader.signal;
+    generateQuestionsWithContext(modelRegistry, model, projectContext, category, previousSessions, effectiveSignal)
       .then((result) => done(result))
       .catch((err) => {
         loader.message = `Error: ${err.message}`;
         setTimeout(() => done(null), 500);
       });
-
     return loader;
   });
 }
@@ -665,17 +739,15 @@ async function generateQuestionsWithContext(
     .map((c) => c.text)
     .join('\n');
 
-  const cleanJson = text.replace(/```(?:json)?\n?/g, '').trim();
-
   try {
-    const parsed = JSON.parse(cleanJson);
+    const parsed = await parseLLMJson(text);
     return {
       questions: parsed.questions as QuestionInput[],
       continue: parsed.continue !== false,
       summary: parsed.summary || '',
     };
-  } catch {
-    throw new Error(`LLM returned invalid JSON: ${text.slice(0, 200)}`);
+  } catch (err: any) {
+    throw new Error(`LLM returned invalid response. Check API key and retry. Details: ${err.message.slice(0, 100)}`);
   }
 }
 
@@ -703,16 +775,22 @@ async function detectProject(cwd: string): Promise<ProjectInfo> {
     'Rust': ['Cargo.toml'],
     'Ruby': ['Gemfile'],
     'Java': ['pom.xml', 'build.gradle'],
-    '.NET': ['*.csproj'],
+    '.NET': [],
     'Mono/Next.js': ['next.config.js', 'next.config.ts'],
     'React/Vite': ['vite.config.ts', 'vite.config.js'],
   };
 
   let type = 'unknown';
-  for (const [name, markers] of Object.entries(indicators)) {
-    if (markers.some(m => files.includes(m))) {
-      type = name;
-      break;
+  
+  // Special check for .csproj files
+  if (files.some(f => f.endsWith('.csproj'))) {
+    type = '.NET';
+  } else {
+    for (const [name, markers] of Object.entries(indicators)) {
+      if (markers.some(m => files.includes(m))) {
+        type = name;
+        break;
+      }
     }
   }
 
@@ -728,18 +806,23 @@ async function detectProject(cwd: string): Promise<ProjectInfo> {
 
 const DEFAULT_FOLDERS = ['src', 'tests', 'docs', 'scripts'];
 
-async function scaffoldProject(cwd: string): Promise<string[]> {
+async function scaffoldProject(cwd: string): Promise<{ created: string[]; failed: string[] }> {
   const created: string[] = [];
+  const failed: string[] = [];
   for (const folder of DEFAULT_FOLDERS) {
     const path = join(cwd, folder);
     try {
       await access(path);
     } catch {
-      await mkdir(path, { recursive: true });
-      created.push(folder);
+      try {
+        await mkdir(path, { recursive: true });
+        created.push(folder);
+      } catch {
+        failed.push(folder);
+      }
     }
   }
-  return created;
+  return { created, failed };
 }
 
 // ─── Grill-new flow orchestrator ────────────────────────────────────────
@@ -751,6 +834,7 @@ async function runGrillNewFlow({
   projectStructure,
   category,
   maxRounds,
+  signal,
 }: {
   ctx: any;
   projectContext: string;
@@ -758,6 +842,7 @@ async function runGrillNewFlow({
   projectStructure: string;
   category: string;
   maxRounds: number;
+  signal?: AbortSignal;
 }): Promise<GrillMeResult> {
   const sessions: GrillSession[] = [];
   let markdownPath: string | null = null;
@@ -774,6 +859,7 @@ async function runGrillNewFlow({
       fullContext,
       category,
       sessions,
+      signal,
     );
 
     if (!generated || !generated.questions.length) {
@@ -781,8 +867,8 @@ async function runGrillNewFlow({
     }
 
     const validation = validateQuestions(generated.questions);
-    if (!validation.valid) {
-      ctx.ui.notify(`LLM question validation failed: ${validation.error}`, 'warning');
+    if (validation.valid === false) {
+      ctx.ui.notify(`Question validation failed: ${validation.error}`, 'warning');
       break;
     }
 
@@ -804,11 +890,12 @@ async function runGrillNewFlow({
     if (round === 0) {
       const beadsAvailable = await hasBeadsDb(ctx.cwd);
       if (beadsAvailable) {
-        const desc = formatBeadDescription(category, sessions.map(s => ({
+        const safeCategory = sanitizeTopic(category);
+        const desc = formatBeadDescription(safeCategory, sessions.map(s => ({
           questions: s.questions,
           answers: s.answers,
         })));
-        beadId = await createGrillBead(ctx.cwd, `New: ${category}`, desc, generated.summary || '');
+        beadId = await createGrillBead(ctx.cwd, `New: ${safeCategory}`, desc, generated.summary || '');
         if (beadId) {
           ctx.ui.notify(`Bead created: ${beadId}`, 'success');
         }
@@ -824,7 +911,7 @@ async function runGrillNewFlow({
         timestamp: s.timestamp,
       }));
 
-      markdownPath = await saveToMarkdown(ctx.cwd, `new-${category}`, tsSessions, fullSummary);
+      markdownPath = await saveToMarkdown(ctx.cwd, sanitizeTopic(`new-${category}`), tsSessions, fullSummary);
       ctx.ui.notify(`Saved: ${markdownPath}`, 'success');
     } else {
       if (markdownPath) {
@@ -857,18 +944,19 @@ async function runGrillNewFlow({
   }
 
   if (beadId && summary) {
-    await addNoteToBead(ctx.cwd, beadId, `FINAL SUMMARY: ${summary}`);
+    await addNoteToBead(ctx.cwd, beadId, `FINAL SUMMARY: ${summary.slice(0, 1000)}`);
   }
-
   if (markdownPath && summary) {
     try {
-      const existing = await readFile(markdownPath, 'utf8');
-      await writeFile(markdownPath, existing + `\n## Final Summary\n\n${summary}\n`, 'utf8');
-    } catch {
-      // ignore
+      await appendToMarkdown(ctx.cwd, markdownPath, -1, {
+        questions: [],
+        answers: [],
+        timestamp: new Date().toISOString(),
+      }, `FINAL SUMMARY: ${summary.slice(0, 1000)}`);
+    } catch (err: any) {
+      ctx.ui.notify(`Failed to save final summary: ${err.message.slice(0, 100)}`, 'warning');
     }
   }
-
   return { sessions, summary, completed: true, cancelled: false };
 }
 
@@ -944,7 +1032,7 @@ export default function grillMeTuiExtension(pi: ExtensionAPI) {
           for (const cat of TOPIC_CATEGORIES) {
             ctx.ui.setStatus('grill-me', ctx.ui.theme.fg('accent', `🔥 ${cat} [${allResults.length + 1}/${TOPIC_CATEGORIES.length}]`));
             try {
-              const result = await runGrillFlow({ ctx, topic: cat, maxRounds });
+              const result = await runGrillFlow({ ctx, topic: cat, maxRounds, signal: ctx.signal });
               allResults.push({ topic: cat, result });
             } catch (err: any) {
               ctx.ui.notify(`${cat}: ${err.message}`, 'error');
@@ -1005,7 +1093,7 @@ export default function grillMeTuiExtension(pi: ExtensionAPI) {
       ctx.ui.setStatus('grill-me', ctx.ui.theme.fg('accent', `🔥 Grilling: ${topic}`));
 
       try {
-        const grillResult = await runGrillFlow({ ctx, topic, maxRounds });
+        const grillResult = await runGrillFlow({ ctx, topic, maxRounds, signal: ctx.signal });
 
         if (grillResult.cancelled) {
           ctx.ui.notify('Grill session cancelled.', 'warning');
@@ -1066,8 +1154,13 @@ export default function grillMeTuiExtension(pi: ExtensionAPI) {
       if (!projectInfo.exists) {
         const confirm = await ctx.ui.confirm('Scaffold project?', `Create: ${DEFAULT_FOLDERS.join(', ')}`);
         if (confirm) {
-          const created = await scaffoldProject(ctx.cwd);
-          ctx.ui.notify(`Created: ${created.join(', ')}`, 'success');
+          const result = await scaffoldProject(ctx.cwd);
+          if (result.created.length > 0) {
+            ctx.ui.notify(`Created: ${result.created.join(', ')}`, 'success');
+          }
+          if (result.failed.length > 0) {
+            ctx.ui.notify(`Failed to create: ${result.failed.join(', ')}`, 'warning');
+          }
         }
       }
 
@@ -1099,6 +1192,7 @@ export default function grillMeTuiExtension(pi: ExtensionAPI) {
             projectStructure: projectInfo.structure,
             category: cat,
             maxRounds,
+            signal: ctx.signal,
           });
           allResults.push({ topic: cat, result });
         } catch (err: any) {
@@ -1108,7 +1202,29 @@ export default function grillMeTuiExtension(pi: ExtensionAPI) {
       }
       ctx.ui.setStatus('grill-me', undefined);
 
-      // Generate PRD checklist
+      // Save individual session markdown files first
+      const sessionsDir = await ensureGrillSessionsDir(ctx.cwd);
+      const slug = projectDesc.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 30);
+      const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      const fileMap: Record<string, string> = {};
+
+      for (const r of allResults) {
+        const catSlug = r.topic.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+        const filename = `${ts}-${slug}-${catSlug}.md`;
+        const filepath = join(sessionsDir, filename);
+        const content = formatMarkdownContent(`${r.topic} (${projectDesc.trim()})`, r.result.sessions.map(s => ({
+          questions: s.questions,
+          answers: s.answers,
+          timestamp: s.timestamp,
+        })), r.result.summary || '');
+        await writeFile(filepath, content, 'utf8');
+        fileMap[r.topic] = filename;
+      }
+
+      // Save combined master report
+      const masterPath = await saveAllMarkdown(ctx.cwd, allResults);
+
+      // Generate PRD checklist with actual file links
       ctx.ui.setStatus('grill-me', ctx.ui.theme.fg('accent', '📝 Generating PRD...'));
       const prdContent = await generatePRD(
         ctx.modelRegistry,
@@ -1116,17 +1232,13 @@ export default function grillMeTuiExtension(pi: ExtensionAPI) {
         projectDesc.trim(),
         projectInfo.type,
         allResults,
+        fileMap,
         new AbortController().signal,
       );
 
-      // Save PRD checklist
-      const sessionsDir = await ensureGrillSessionsDir(ctx.cwd);
       const prdPath = join(sessionsDir, 'project-context.md');
       await writeFile(prdPath, prdContent, 'utf8');
       ctx.ui.setStatus('grill-me', undefined);
-
-      // Save master summary
-      const masterPath = await saveAllMarkdown(ctx.cwd, allResults);
       const completed = allResults.filter(r => r.result.completed).length;
       const totalSessions = allResults.reduce((sum, r) => sum + r.result.sessions.length, 0);
 

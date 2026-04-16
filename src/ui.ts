@@ -224,12 +224,19 @@ export async function runQuestionnaireUI(
     }
 
     function handleInput(data: string) {
-      if (uiState.inputMode === 'otherInput' && matchesKey(data, Key.escape)) {
-        clearInputMode();
+      // Text input mode: route to editor FIRST, only Esc escapes
+      if (uiState.inputMode === 'otherInput') {
+        if (matchesKey(data, Key.escape)) {
+          clearInputMode();
+          invalidate();
+          return;
+        }
+        editor.handleInput(data);
         invalidate();
         return;
       }
 
+      // Navigation shortcuts only when NOT in text input mode
       if (matchesKey(data, Key.left)) {
         switchTabs(-1);
         return;
@@ -242,12 +249,6 @@ export async function runQuestionnaireUI(
 
       if (isRKey(data)) {
         jumpToReview();
-        return;
-      }
-
-      if (uiState.inputMode === 'otherInput') {
-        editor.handleInput(data);
-        invalidate();
         return;
       }
 
