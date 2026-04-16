@@ -14,11 +14,22 @@ Generates sharp design questions via LLM, renders them in a TUI questionnaire, p
 
 ## Usage
 
+### `/grill` — Review existing systems
 ```
 /grill                    # Interactive topic picker
 /grill "API architecture" # Start grilling on specific topic
 /grill "data model" 5     # Topic with 5 max rounds
 ```
+
+### `/grill-new` — Start a new project
+```
+/grill-new
+```
+1. Describes the project ("A SaaS todo app with teams")
+2. Detects existing project or scaffolds basic folders (`src/`, `tests/`, `docs/`, `scripts/`)
+3. Pick categories (or All)
+4. LLM generates questions specific to *your* project
+5. All answers + project context saved to beads + markdown + `.grill-sessions/project-context.md`
 
 ## Install
 

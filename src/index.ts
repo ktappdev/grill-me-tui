@@ -9,6 +9,7 @@
  */
 
 import type { ExtensionAPI } from '@mariozechner/pi-coding-agent';
+import { BorderedLoader } from '@mariozechner/pi-coding-agent';
 import { complete, type UserMessage } from '@mariozechner/pi-ai';
 import { mkdir, writeFile, readFile, access, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -209,6 +210,38 @@ function formatAnswerValueForMarkdown(answer: NormalizedAnswer): string {
 
 // ─── LLM question generation ────────────────────────────────────────────
 
+async function generateQuestionsWithLoader(
+  uiCtx: any,
+  modelRegistry: any,
+  model: any,
+  topic: string,
+  previousSessions: GrillSession[],
+): Promise<{ questions: QuestionInput[]; continue: boolean; summary: string } | null> {
+  return uiCtx.ui.custom<{
+    questions: QuestionInput[];
+    continue: boolean;
+    summary: string;
+  } | null>((tui, theme, _kb, done) => {
+    const loader = new BorderedLoader(tui, theme, `Generating questions${topic ? ` — ${topic}` : ''}...`);
+    loader.onAbort = () => done(null);
+
+    generateQuestions(
+      modelRegistry,
+      model,
+      topic,
+      previousSessions,
+      loader.signal,
+    )
+      .then((result) => done(result))
+      .catch((err) => {
+        loader.message = `Error: ${err.message}`;
+        setTimeout(() => done(null), 500);
+      });
+
+    return loader;
+  });
+}
+
 async function generateQuestions(
   modelRegistry: any,
   model: any,
@@ -291,13 +324,13 @@ async function runGrillFlow({ ctx, topic, maxRounds }: GrillOrchestratorOptions)
   let summary = '';
 
   for (let round = 0; round < maxRounds; round++) {
-    // Generate questions via LLM
-    const generated = await generateQuestions(
+    // Generate questions via LLM (with spinner overlay)
+    const generated = await generateQuestionsWithLoader(
+      ctx,
       ctx.modelRegistry,
       ctx.model,
       topic,
       sessions,
-      ctx.signal ?? new AbortController().signal,
     );
 
     if (!generated || !generated.questions.length) {
@@ -446,6 +479,40 @@ Response format: Return ONLY valid JSON with this exact shape. No markdown, no e
 
 Set "continue" to false when enough has been resolved to proceed with implementation.
 `;
+
+async function generateQuestionsWithContextWithLoader(
+  uiCtx: any,
+  modelRegistry: any,
+  model: any,
+  projectContext: string,
+  category: string,
+  previousSessions: GrillSession[],
+): Promise<{ questions: QuestionInput[]; continue: boolean; summary: string } | null> {
+  return uiCtx.ui.custom<{
+    questions: QuestionInput[];
+    continue: boolean;
+    summary: string;
+  } | null>((tui, theme, _kb, done) => {
+    const loader = new BorderedLoader(tui, theme, `Generating ${category} questions...`);
+    loader.onAbort = () => done(null);
+
+    generateQuestionsWithContext(
+      modelRegistry,
+      model,
+      projectContext,
+      category,
+      previousSessions,
+      loader.signal,
+    )
+      .then((result) => done(result))
+      .catch((err) => {
+        loader.message = `Error: ${err.message}`;
+        setTimeout(() => done(null), 500);
+      });
+
+    return loader;
+  });
+}
 
 async function generateQuestionsWithContext(
   modelRegistry: any,
@@ -604,13 +671,13 @@ async function runGrillNewFlow({
   const fullContext = `Project: ${projectContext}\nType: ${projectType}\nStructure: ${projectStructure || 'Empty directory'}`;
 
   for (let round = 0; round < maxRounds; round++) {
-    const generated = await generateQuestionsWithContext(
+    const generated = await generateQuestionsWithContextWithLoader(
+      ctx,
       ctx.modelRegistry,
       ctx.model,
       fullContext,
       category,
       sessions,
-      ctx.signal ?? new AbortController().signal,
     );
 
     if (!generated || !generated.questions.length) {
