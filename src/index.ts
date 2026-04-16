@@ -10,7 +10,7 @@
 
 import type { ExtensionAPI } from '@mariozechner/pi-coding-agent';
 import { complete, type UserMessage } from '@mariozechner/pi-ai';
-import { mkdir, writeFile, readFile, access } from 'node:fs/promises';
+import { mkdir, writeFile, readFile, access, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
   formatBeadDescription,
@@ -408,6 +408,307 @@ async function runGrillFlow({ ctx, topic, maxRounds }: GrillOrchestratorOptions)
   return { sessions, summary, completed: true, cancelled: false };
 }
 
+// ─── Project context question generation ────────────────────────────────
+
+const GRILL_NEW_SYSTEM_PROMPT = `You are a ruthless design interviewer. Your job is to stress-test a new project plan by asking sharp, specific questions that expose ambiguities, hidden assumptions, and unresolved dependencies.
+
+Project context:
+{projectContext}
+
+Rules:
+- Ask 1 to 5 questions per round.
+- Each question must be specific to THIS project, not generic.
+- Reference the actual project description, tech stack, target users, and any existing structure.
+- Each question must have a clear purpose: resolve ambiguity, force a tradeoff, or expose a hidden assumption.
+- Questions should be answerable with a single choice or short text.
+- For each question, provide 2-4 options plus an "Other" free-text option.
+- Do NOT ask questions that have already been answered.
+- Focus on: architecture decisions, data flow, error handling, performance, security, scalability, developer experience, testing strategy.
+
+Response format: Return ONLY valid JSON with this exact shape. No markdown, no explanation, no code fences.
+
+{
+  "questions": [
+    {
+      "id": "unique-lowercase-id",
+      "label": "Short label",
+      "prompt": "The full question text",
+      "options": [
+        {"value": "option-value", "label": "Option Label", "description": "Optional description"}
+      ],
+      "allowOther": true,
+      "recommended": "The value of the option you recommend, or free text recommendation"
+    }
+  ],
+  "continue": true,
+  "summary": "Brief summary of what's been resolved so far"
+}
+
+Set "continue" to false when enough has been resolved to proceed with implementation.
+`;
+
+async function generateQuestionsWithContext(
+  modelRegistry: any,
+  model: any,
+  projectContext: string,
+  category: string,
+  previousSessions: GrillSession[],
+  signal: AbortSignal,
+): Promise<{ questions: QuestionInput[]; continue: boolean; summary: string } | null> {
+  const auth = await modelRegistry.getApiKeyAndHeaders(model);
+  if (!auth.ok || !auth.apiKey) {
+    throw new Error(auth.ok ? `No API key for ${model.provider}` : auth.error);
+  }
+
+  const prompt = GRILL_NEW_SYSTEM_PROMPT.replace('{projectContext}', projectContext);
+
+  let conversationHistory = `Category: ${category}\n\n`;
+
+  if (previousSessions.length > 0) {
+    conversationHistory += 'Previous rounds:\n\n';
+    previousSessions.forEach((session, round) => {
+      conversationHistory += `### Round ${round + 1}\n`;
+      session.questions.forEach((q, i) => {
+        const a = session.answers[i];
+        const answerText = a ? formatAnswerValueForMarkdown(a) : '(skipped)';
+        conversationHistory += `- ${q.prompt} → ${answerText}\n`;
+      });
+      conversationHistory += '\n';
+    });
+    const lastSession = previousSessions[previousSessions.length - 1];
+    conversationHistory += `\nCurrent summary: ${lastSession ? lastSession.round + ' rounds completed' : 'none yet'}\n\n`;
+  }
+
+  conversationHistory += `Generate the next round of design questions for the ${category} category.`;
+
+  const userMessage: UserMessage = {
+    role: 'user',
+    content: [{ type: 'text', text: conversationHistory }],
+    timestamp: Date.now(),
+  };
+
+  const response = await complete(
+    model,
+    { systemPrompt: prompt, messages: [userMessage] },
+    { apiKey: auth.apiKey, headers: auth.headers, signal },
+  );
+
+  if (response.stopReason === 'aborted') {
+    return null;
+  }
+
+  const text = response.content
+    .filter((c): c is { type: 'text'; text: string } => c.type === 'text')
+    .map((c) => c.text)
+    .join('\n');
+
+  const cleanJson = text.replace(/```(?:json)?\n?/g, '').trim();
+
+  try {
+    const parsed = JSON.parse(cleanJson);
+    return {
+      questions: parsed.questions as QuestionInput[],
+      continue: parsed.continue !== false,
+      summary: parsed.summary || '',
+    };
+  } catch {
+    throw new Error(`LLM returned invalid JSON: ${text.slice(0, 200)}`);
+  }
+}
+
+// ─── Project detection & scaffolding ────────────────────────────────────
+
+interface ProjectInfo {
+  exists: boolean;
+  type: string;
+  files: string[];
+  structure: string;
+}
+
+async function detectProject(cwd: string): Promise<ProjectInfo> {
+  let files: string[] = [];
+  try {
+    files = await readdir(cwd);
+  } catch {
+    return { exists: false, type: 'empty', files: [], structure: '' };
+  }
+
+  const indicators: Record<string, string[]> = {
+    'Node.js/TypeScript': ['package.json', 'tsconfig.json'],
+    'Python': ['requirements.txt', 'pyproject.toml', 'setup.py'],
+    'Go': ['go.mod'],
+    'Rust': ['Cargo.toml'],
+    'Ruby': ['Gemfile'],
+    'Java': ['pom.xml', 'build.gradle'],
+    '.NET': ['*.csproj'],
+    'Mono/Next.js': ['next.config.js', 'next.config.ts'],
+    'React/Vite': ['vite.config.ts', 'vite.config.js'],
+  };
+
+  let type = 'unknown';
+  for (const [name, markers] of Object.entries(indicators)) {
+    if (markers.some(m => files.includes(m))) {
+      type = name;
+      break;
+    }
+  }
+
+  const structure = files.slice(0, 20).join(', ');
+
+  return {
+    exists: files.length > 0,
+    type,
+    files,
+    structure,
+  };
+}
+
+const DEFAULT_FOLDERS = ['src', 'tests', 'docs', 'scripts'];
+
+async function scaffoldProject(cwd: string): Promise<string[]> {
+  const created: string[] = [];
+  for (const folder of DEFAULT_FOLDERS) {
+    const path = join(cwd, folder);
+    try {
+      await access(path);
+    } catch {
+      await mkdir(path, { recursive: true });
+      created.push(folder);
+    }
+  }
+  return created;
+}
+
+// ─── Grill-new flow orchestrator ────────────────────────────────────────
+
+async function runGrillNewFlow({
+  ctx,
+  projectContext,
+  projectType,
+  projectStructure,
+  category,
+  maxRounds,
+}: {
+  ctx: any;
+  projectContext: string;
+  projectType: string;
+  projectStructure: string;
+  category: string;
+  maxRounds: number;
+}): Promise<GrillMeResult> {
+  const sessions: GrillSession[] = [];
+  let markdownPath: string | null = null;
+  let beadId: string | null = null;
+  let summary = '';
+
+  const fullContext = `Project: ${projectContext}\nType: ${projectType}\nStructure: ${projectStructure || 'Empty directory'}`;
+
+  for (let round = 0; round < maxRounds; round++) {
+    const generated = await generateQuestionsWithContext(
+      ctx.modelRegistry,
+      ctx.model,
+      fullContext,
+      category,
+      sessions,
+      ctx.signal ?? new AbortController().signal,
+    );
+
+    if (!generated || !generated.questions.length) {
+      break;
+    }
+
+    const validation = validateQuestions(generated.questions);
+    if (!validation.valid) {
+      ctx.ui.notify(`LLM question validation failed: ${validation.error}`, 'warning');
+      break;
+    }
+
+    const questions = normalizeQuestions(generated.questions);
+    const uiResult = await runQuestionnaireUI(ctx, questions);
+
+    if (uiResult.cancelled) {
+      return { sessions, summary, completed: false, cancelled: true };
+    }
+
+    const session: GrillSession = {
+      round: round + 1,
+      questions,
+      answers: uiResult.answers,
+      timestamp: new Date().toISOString(),
+    };
+    sessions.push(session);
+
+    if (round === 0) {
+      const beadsAvailable = await hasBeadsDb(ctx.cwd);
+      if (beadsAvailable) {
+        const desc = formatBeadDescription(category, sessions.map(s => ({
+          questions: s.questions,
+          answers: s.answers,
+        })));
+        beadId = await createGrillBead(ctx.cwd, `New: ${category}`, desc, generated.summary || '');
+        if (beadId) {
+          ctx.ui.notify(`Bead created: ${beadId}`, 'success');
+        }
+      }
+
+      const fullSummary = generated.summary || sessions.map(s =>
+        s.answers.map(a => `${a.questionLabel}: ${formatAnswerValueForMarkdown(a)}`).join('; ')
+      ).join(' | ');
+
+      const tsSessions = sessions.map(s => ({
+        questions: s.questions,
+        answers: s.answers,
+        timestamp: s.timestamp,
+      }));
+
+      markdownPath = await saveToMarkdown(ctx.cwd, `new-${category}`, tsSessions, fullSummary);
+      ctx.ui.notify(`Saved: ${markdownPath}`, 'success');
+    } else {
+      if (markdownPath) {
+        await appendToMarkdown(ctx.cwd, markdownPath, round, {
+          questions: session.questions,
+          answers: session.answers,
+          timestamp: session.timestamp,
+        }, generated.summary || '');
+      }
+      if (beadId) {
+        const roundNote = `Round ${round + 1}: ${session.answers.map(a =>
+          `${a.questionLabel}: ${formatAnswerValueForMarkdown(a)}`
+        ).join(' | ')}`;
+        await addNoteToBead(ctx.cwd, beadId, roundNote);
+      }
+    }
+
+    summary = generated.summary;
+
+    const answerSummary = formatExpandedAnswerLines({
+      questions,
+      answers: uiResult.answers,
+      cancelled: false,
+    }).join('\n');
+    ctx.ui.notify(`Round ${round + 1} complete:\n${answerSummary}`, 'info');
+
+    if (!generated.continue) {
+      break;
+    }
+  }
+
+  if (beadId && summary) {
+    await addNoteToBead(ctx.cwd, beadId, `FINAL SUMMARY: ${summary}`);
+  }
+
+  if (markdownPath && summary) {
+    try {
+      const existing = await readFile(markdownPath, 'utf8');
+      await writeFile(markdownPath, existing + `\n## Final Summary\n\n${summary}\n`, 'utf8');
+    } catch {
+      // ignore
+    }
+  }
+
+  return { sessions, summary, completed: true, cancelled: false };
+}
+
 // ─── Topic selection using built-in UI ──────────────────────────────────
 
 const TOPIC_SUGGESTIONS = [
@@ -545,6 +846,124 @@ export default function grillMeTuiExtension(pi: ExtensionAPI) {
         ctx.ui.notify(`Grill failed: ${err.message}`, 'error');
       } finally {
         ctx.ui.setStatus('grill-me', undefined);
+      }
+    },
+  });
+
+  // ─── /grill-new ─────────────────────────────────────────────────────
+
+  pi.registerCommand('grill-new', {
+    description: 'Start a new project grill session. Captures project context, sets up structure, then grills all relevant categories.',
+    handler: async (_args: string | undefined, ctx: any) => {
+      if (!ctx.hasUI) {
+        ctx.ui.notify('/grill-new requires interactive mode.', 'error');
+        return;
+      }
+
+      if (!ctx.model) {
+        ctx.ui.notify('No model selected.', 'error');
+        return;
+      }
+
+      // Step 1: What are we building?
+      const projectDesc = await ctx.ui.input('🔥 What are we building?\nDescribe the project in 1-2 sentences...');
+      if (!projectDesc || !projectDesc.trim()) {
+        ctx.ui.notify('Cancelled.', 'info');
+        return;
+      }
+
+      // Step 2: Detect existing project
+      const projectInfo = await detectProject(ctx.cwd);
+      ctx.ui.notify(
+        projectInfo.exists
+          ? `Found ${projectInfo.type} project: ${projectInfo.files.filter(f => !f.startsWith('.')).join(', ') || 'files'}`
+          : 'Empty directory — will scaffold basic structure',
+        'info',
+      );
+
+      // Step 3: Scaffold if empty
+      if (!projectInfo.exists) {
+        const confirm = await ctx.ui.confirm('Scaffold project?', `Create: ${DEFAULT_FOLDERS.join(', ')}`);
+        if (confirm) {
+          const created = await scaffoldProject(ctx.cwd);
+          ctx.ui.notify(`Created: ${created.join(', ')}`, 'success');
+        }
+      }
+
+      // Step 4: Pick categories
+      const choice = await ctx.ui.select('🔥 Which categories to grill?', TOPIC_SUGGESTIONS);
+      if (!choice) {
+        ctx.ui.notify('Cancelled.', 'info');
+        return;
+      }
+
+      const roundsInput = await ctx.ui.input('Max rounds per category? (default: 3)');
+      const maxRounds = roundsInput && /^\d+$/.test(roundsInput.trim())
+        ? Math.max(1, Math.min(10, parseInt(roundsInput.trim(), 10)))
+        : 3;
+
+      // Step 5: Run grilling
+      const selectedCategories = choice === 'All' ? TOPIC_CATEGORIES : [choice];
+      const allResults: Array<{ topic: string; result: GrillMeResult }> = [];
+
+      ctx.ui.notify(`Grilling ${selectedCategories.length} categories, ${maxRounds} rounds each...`, 'info');
+
+      for (const cat of selectedCategories) {
+        ctx.ui.setStatus('grill-me', ctx.ui.theme.fg('accent', `🔥 ${cat} [${allResults.length + 1}/${selectedCategories.length}]`));
+        try {
+          const result = await runGrillNewFlow({
+            ctx,
+            projectContext: projectDesc.trim(),
+            projectType: projectInfo.type,
+            projectStructure: projectInfo.structure,
+            category: cat,
+            maxRounds,
+          });
+          allResults.push({ topic: cat, result });
+        } catch (err: any) {
+          ctx.ui.notify(`${cat}: ${err.message}`, 'error');
+          allResults.push({ topic: cat, result: { sessions: [], summary: `Failed: ${err.message}`, completed: false, cancelled: false } });
+        }
+      }
+      ctx.ui.setStatus('grill-me', undefined);
+
+      // Save master summary
+      const masterPath = await saveAllMarkdown(ctx.cwd, allResults);
+      const completed = allResults.filter(r => r.result.completed).length;
+      const totalSessions = allResults.reduce((sum, r) => sum + r.result.sessions.length, 0);
+
+      ctx.ui.notify(
+        `Done! ${completed}/${selectedCategories.length} completed, ${totalSessions} total rounds.\nMaster: ${masterPath}`,
+        'success',
+      );
+
+      // Save project context to a file for reference
+      const contextPath = join(ctx.cwd, '.grill-sessions', 'project-context.md');
+      const contextContent = `# Project Context\n\n${projectDesc.trim()}\n\n**Type:** ${projectInfo.type}\n**Structure:** ${projectInfo.structure || 'Empty'}\n\n## Grill Results\n\n${allResults.map(r =>
+        `### ${r.topic}\n\n${r.result.summary || 'No summary'}\n\nRounds: ${r.result.sessions.length}\nStatus: ${r.result.completed ? 'Complete' : 'Incomplete'}\n`
+      ).join('\n---\n\n')}\n`;
+      try {
+        const sessionsDir = await ensureGrillSessionsDir(ctx.cwd);
+        await writeFile(contextPath, contextContent, 'utf8');
+      } catch {
+        // ignore
+      }
+
+      // Save master bead
+      const beadsAvailable = await hasBeadsDb(ctx.cwd);
+      if (beadsAvailable) {
+        const masterDesc = allResults.map(r =>
+          `## ${r.topic}\n\n${r.result.summary || 'No summary'}`
+        ).join('\n\n');
+        const masterBeadId = await createGrillBead(
+          ctx.cwd,
+          `New project: ${projectDesc.trim().slice(0, 50)}`,
+          masterDesc,
+          `${completed}/${selectedCategories.length} completed, ${totalSessions} rounds`,
+        );
+        if (masterBeadId) {
+          ctx.ui.notify(`Master bead: ${masterBeadId}`, 'success');
+        }
       }
     },
   });
