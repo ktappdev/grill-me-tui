@@ -62,12 +62,13 @@ async function parseLLMJson(text: string, maxRetries: number = 2): Promise<any> 
 const GRILL_SYSTEM_PROMPT = `You are a ruthless design interviewer. Your job is to stress-test a design plan by asking sharp, specific questions that expose ambiguities, hidden assumptions, and unresolved dependencies.
 
 Rules:
-- Ask 1 to 5 questions per round.
+- Ask 1 to 5 questions per round. If this category is NOT relevant to the project, or all decisions are already made, return empty questions: {"questions": [], "continue": false, "summary": "Category skipped — not relevant"}.
 - Each question must have a clear purpose: resolve ambiguity, force a tradeoff, or expose a hidden assumption.
 - Provide a recommended answer (your best guess) as the "recommended" value.
 - Questions should be answerable with a single choice or short text.
 - For each question, provide 2-4 options plus an "Other" free-text option.
-- Do NOT ask questions that have already been answered.
+- NEVER re-ask questions already in the DECISION LOG below.
+- NEVER suggest options that contradict any DECISION LOG entry. Build on established decisions.
 - Focus on: architecture decisions, data flow, error handling, performance, security, scalability, developer experience, testing strategy.
 
 Response format: Return ONLY valid JSON with this exact shape. No markdown, no explanation, no code fences.
@@ -414,12 +415,13 @@ async function generateQuestionsWithLoader(
   topic: string,
   previousSessions: GrillSession[],
   signal?: AbortSignal,
-): Promise<{ questions: QuestionInput[]; continue: boolean; summary: string } | null> {
+  decisionLog?: string,
+): Promise<{ questions: QuestionInput[]; continue: boolean; summary: string; skipped?: boolean } | null> {
   return uiCtx.ui.custom((tui, theme, _kb, done) => {
     const loader = new BorderedLoader(tui, theme, `Generating questions${topic ? ` — ${topic}` : ''}...`);
     loader.onAbort = () => done(null);
     const effectiveSignal = signal ?? loader.signal;
-    generateQuestions(modelRegistry, model, topic, previousSessions, effectiveSignal)
+    generateQuestions(modelRegistry, model, topic, previousSessions, effectiveSignal, decisionLog)
       .then((result) => done(result))
       .catch((err) => {
         loader.message = `Error: ${err.message}`;
@@ -435,13 +437,19 @@ async function generateQuestions(
   topic: string,
   previousSessions: GrillSession[],
   signal: AbortSignal,
-): Promise<{ questions: QuestionInput[]; continue: boolean; summary: string } | null> {
+  decisionLog?: string,
+): Promise<{ questions: QuestionInput[]; continue: boolean; summary: string; skipped?: boolean } | null> {
   const auth = await modelRegistry.getApiKeyAndHeaders(model);
   if (!auth.ok || !auth.apiKey) {
     throw new Error(auth.ok ? `No API key for ${model.provider}` : auth.error);
   }
 
   let conversationHistory = `Design topic: ${topic}\n\n`;
+
+  // Inject decision log from other categories
+  if (decisionLog) {
+    conversationHistory += `## DECISION LOG (from other categories — DO NOT contradict these)\n${decisionLog}\n\n`;
+  }
 
   if (previousSessions.length > 0) {
     conversationHistory += 'Previous rounds:\n\n';
@@ -450,7 +458,8 @@ async function generateQuestions(
       session.questions.forEach((q, i) => {
         const a = session.answers[i];
         const answerText = a ? formatAnswerValueForMarkdown(a) : '(skipped)';
-        conversationHistory += `- ${q.prompt} → ${answerText}\n`;
+        const tag = a && isAnswerAmbiguous(a) ? 'AMBIGUOUS' : 'DECIDED';
+        conversationHistory += `- ✅ ${tag}: ${q.prompt}\n  → ${answerText}\n`;
       });
       conversationHistory += '\n';
     });
@@ -483,10 +492,12 @@ async function generateQuestions(
 
   try {
     const parsed = await parseLLMJson(text);
+    const isSkipped = !parsed.questions || parsed.questions.length === 0;
     return {
-      questions: parsed.questions as QuestionInput[],
+      questions: parsed.questions as QuestionInput[] || [],
       continue: parsed.continue !== false,
       summary: parsed.summary || '',
+      skipped: isSkipped,
     };
   } catch (err: any) {
     throw new Error(`LLM returned invalid response. Check API key and retry. Details: ${err.message.slice(0, 100)}`);
@@ -500,9 +511,10 @@ interface GrillOrchestratorOptions {
   topic: string;
   maxRounds: number;
   signal?: AbortSignal;
+  decisionLog?: string;
 }
 
-async function runGrillFlow({ ctx, topic, maxRounds, signal }: GrillOrchestratorOptions): Promise<GrillMeResult> {
+async function runGrillFlow({ ctx, topic, maxRounds, signal, decisionLog }: GrillOrchestratorOptions): Promise<GrillMeResult> {
   const sessions: GrillSession[] = [];
   let markdownPath: string | null = null;
   let beadId: string | null = null;
@@ -516,9 +528,20 @@ async function runGrillFlow({ ctx, topic, maxRounds, signal }: GrillOrchestrator
       topic,
       sessions,
       signal,
+      decisionLog,
     );
 
-    if (!generated || !generated.questions.length) {
+    if (!generated) {
+      break;
+    }
+
+    // Category skipped by LLM (not relevant or already decided)
+    if (generated.skipped) {
+      ctx.ui.notify(`⏭ ${topic}: Skipped — not relevant or already resolved`, 'info');
+      return { sessions, summary: generated.summary || 'Skipped', completed: true, cancelled: false };
+    }
+
+    if (!generated.questions.length) {
       break;
     }
 
@@ -630,13 +653,14 @@ Project context:
 {projectContext}
 
 Rules:
-- Ask 1 to 5 questions per round.
+- Ask 1 to 5 questions per round. If this category is NOT relevant to this project, or all decisions are already made, return empty questions: {"questions": [], "continue": false, "summary": "Category skipped — not relevant"}.
 - Each question must be specific to THIS project, not generic.
 - Reference the actual project description, tech stack, target users, and any existing structure.
 - Each question must have a clear purpose: resolve ambiguity, force a tradeoff, or expose a hidden assumption.
 - Questions should be answerable with a single choice or short text.
 - For each question, provide 2-4 options plus an "Other" free-text option.
-- Do NOT ask questions that have already been answered.
+- NEVER re-ask questions already in the DECISION LOG below.
+- NEVER suggest options that contradict any DECIDED entry. Build on established decisions.
 - Focus on: architecture decisions, data flow, error handling, performance, security, scalability, developer experience, testing strategy.
 
 Response format: Return ONLY valid JSON with this exact shape. No markdown, no explanation, no code fences.
@@ -669,12 +693,13 @@ async function generateQuestionsWithContextWithLoader(
   category: string,
   previousSessions: GrillSession[],
   signal?: AbortSignal,
-): Promise<{ questions: QuestionInput[]; continue: boolean; summary: string } | null> {
+  decisionLog?: string,
+): Promise<{ questions: QuestionInput[]; continue: boolean; summary: string; skipped?: boolean } | null> {
   return uiCtx.ui.custom((tui, theme, _kb, done) => {
     const loader = new BorderedLoader(tui, theme, `Generating ${category} questions...`);
     loader.onAbort = () => done(null);
     const effectiveSignal = signal ?? loader.signal;
-    generateQuestionsWithContext(modelRegistry, model, projectContext, category, previousSessions, effectiveSignal)
+    generateQuestionsWithContext(modelRegistry, model, projectContext, category, previousSessions, effectiveSignal, decisionLog)
       .then((result) => done(result))
       .catch((err) => {
         loader.message = `Error: ${err.message}`;
@@ -691,7 +716,8 @@ async function generateQuestionsWithContext(
   category: string,
   previousSessions: GrillSession[],
   signal: AbortSignal,
-): Promise<{ questions: QuestionInput[]; continue: boolean; summary: string } | null> {
+  decisionLog?: string,
+): Promise<{ questions: QuestionInput[]; continue: boolean; summary: string; skipped?: boolean } | null> {
   const auth = await modelRegistry.getApiKeyAndHeaders(model);
   if (!auth.ok || !auth.apiKey) {
     throw new Error(auth.ok ? `No API key for ${model.provider}` : auth.error);
@@ -701,6 +727,11 @@ async function generateQuestionsWithContext(
 
   let conversationHistory = `Category: ${category}\n\n`;
 
+  // Inject cross-category decision log
+  if (decisionLog) {
+    conversationHistory += `## DECISION LOG (from other categories — DO NOT contradict these)\n${decisionLog}\n`;
+  }
+
   if (previousSessions.length > 0) {
     conversationHistory += 'Previous rounds:\n\n';
     previousSessions.forEach((session, round) => {
@@ -708,7 +739,8 @@ async function generateQuestionsWithContext(
       session.questions.forEach((q, i) => {
         const a = session.answers[i];
         const answerText = a ? formatAnswerValueForMarkdown(a) : '(skipped)';
-        conversationHistory += `- ${q.prompt} → ${answerText}\n`;
+        const tag = a && isAnswerAmbiguous(a) ? 'AMBIGUOUS' : 'DECIDED';
+        conversationHistory += `- ✅ ${tag}: ${q.prompt}\n  → ${answerText}\n`;
       });
       conversationHistory += '\n';
     });
@@ -741,10 +773,12 @@ async function generateQuestionsWithContext(
 
   try {
     const parsed = await parseLLMJson(text);
+    const isSkipped = !parsed.questions || parsed.questions.length === 0;
     return {
-      questions: parsed.questions as QuestionInput[],
+      questions: parsed.questions as QuestionInput[] || [],
       continue: parsed.continue !== false,
       summary: parsed.summary || '',
+      skipped: isSkipped,
     };
   } catch (err: any) {
     throw new Error(`LLM returned invalid response. Check API key and retry. Details: ${err.message.slice(0, 100)}`);
@@ -825,6 +859,23 @@ async function scaffoldProject(cwd: string): Promise<{ created: string[]; failed
   return { created, failed };
 }
 
+// ─── Decision log builder ──────────────────────────────────────────────
+
+function buildDecisionLog(topic: string, result: GrillMeResult): string {
+  let log = `## ${topic}\n`;
+  result.sessions.forEach((s) => {
+    s.questions.forEach((q, i) => {
+      const a = s.answers[i];
+      if (a && !isAnswerAmbiguous(a)) {
+        const answer = formatAnswerValueForMarkdown(a);
+        log += `- ✅ ${q.prompt}\n  → ${answer}\n`;
+      }
+    });
+  });
+  log += '\n';
+  return log;
+}
+
 // ─── Grill-new flow orchestrator ────────────────────────────────────────
 
 async function runGrillNewFlow({
@@ -835,6 +886,7 @@ async function runGrillNewFlow({
   category,
   maxRounds,
   signal,
+  decisionLog,
 }: {
   ctx: any;
   projectContext: string;
@@ -843,6 +895,7 @@ async function runGrillNewFlow({
   category: string;
   maxRounds: number;
   signal?: AbortSignal;
+  decisionLog?: string;
 }): Promise<GrillMeResult> {
   const sessions: GrillSession[] = [];
   let markdownPath: string | null = null;
@@ -860,9 +913,20 @@ async function runGrillNewFlow({
       category,
       sessions,
       signal,
+      decisionLog,
     );
 
-    if (!generated || !generated.questions.length) {
+    if (!generated) {
+      break;
+    }
+
+    // Category skipped by LLM (not relevant or already decided)
+    if (generated.skipped) {
+      ctx.ui.notify(`⏭ ${category}: Skipped — not relevant or already resolved`, 'info');
+      return { sessions, summary: generated.summary || 'Skipped', completed: true, cancelled: false };
+    }
+
+    if (!generated.questions.length) {
       break;
     }
 
@@ -1026,19 +1090,28 @@ export default function grillMeTuiExtension(pi: ExtensionAPI) {
         }
 
         if (choice === 'All') {
-          // Run all topics sequentially
+          // Run all topics sequentially with cross-category decision log
           ctx.ui.notify(`Grilling all ${TOPIC_CATEGORIES.length} categories, ${maxRounds} rounds each...`, 'info');
           const allResults: Array<{ topic: string; result: GrillMeResult }> = [];
+          let decisionLog = ''; // Builds as categories complete
+
           for (const cat of TOPIC_CATEGORIES) {
             ctx.ui.setStatus('grill-me', ctx.ui.theme.fg('accent', `🔥 ${cat} [${allResults.length + 1}/${TOPIC_CATEGORIES.length}]`));
             try {
-              const result = await runGrillFlow({ ctx, topic: cat, maxRounds, signal: ctx.signal });
+              const result = await runGrillFlow({ ctx, topic: cat, maxRounds, signal: ctx.signal, decisionLog });
               if (result.cancelled && result.sessions.length === 0) {
                 ctx.ui.notify(`⏭ Skipped: ${cat}`, 'info');
               } else if (result.cancelled) {
                 ctx.ui.notify(`⏹ Ended early: ${cat} (${result.sessions.length} rounds kept)`, 'info');
+              } else if (result.summary === 'Skipped') {
+                ctx.ui.notify(`⏭ Skipped: ${cat} (not relevant or already resolved)`, 'info');
               }
               allResults.push({ topic: cat, result });
+
+              // Append this category's decisions to the log for next categories
+              if (result.sessions.length > 0) {
+                decisionLog += buildDecisionLog(cat, result);
+              }
             } catch (err: any) {
               ctx.ui.notify(`${cat}: ${err.message}`, 'error');
               allResults.push({ topic: cat, result: { sessions: [], summary: `Failed: ${err.message}`, completed: false, cancelled: false } });
@@ -1181,9 +1254,10 @@ export default function grillMeTuiExtension(pi: ExtensionAPI) {
         ? Math.max(1, Math.min(10, parseInt(roundsInput.trim(), 10)))
         : 3;
 
-      // Step 5: Run grilling
+      // Step 5: Run grilling with cross-category decision log
       const selectedCategories = choice === 'All' ? TOPIC_CATEGORIES : [choice];
       const allResults: Array<{ topic: string; result: GrillMeResult }> = [];
+      let decisionLog = ''; // Builds as categories complete
 
       ctx.ui.notify(`Grilling ${selectedCategories.length} categories, ${maxRounds} rounds each...`, 'info');
 
@@ -1198,13 +1272,21 @@ export default function grillMeTuiExtension(pi: ExtensionAPI) {
             category: cat,
             maxRounds,
             signal: ctx.signal,
+            decisionLog,
           });
           if (result.cancelled && result.sessions.length === 0) {
             ctx.ui.notify(`⏭ Skipped: ${cat}`, 'info');
           } else if (result.cancelled) {
             ctx.ui.notify(`⏹ Ended early: ${cat} (${result.sessions.length} rounds kept)`, 'info');
+          } else if (result.summary === 'Skipped') {
+            ctx.ui.notify(`⏭ Skipped: ${cat} (not relevant or already resolved)`, 'info');
           }
           allResults.push({ topic: cat, result });
+
+          // Append this category's decisions to the log for next categories
+          if (result.sessions.length > 0) {
+            decisionLog += buildDecisionLog(cat, result);
+          }
         } catch (err: any) {
           ctx.ui.notify(`${cat}: ${err.message}`, 'error');
           allResults.push({ topic: cat, result: { sessions: [], summary: `Failed: ${err.message}`, completed: false, cancelled: false } });
