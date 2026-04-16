@@ -957,10 +957,20 @@ export default function grillMeTuiExtension(pi: ExtensionAPI) {
           const masterPath = await saveAllMarkdown(ctx.cwd, allResults);
           const completed = allResults.filter(r => r.result.completed).length;
           const totalSessions = allResults.reduce((sum, r) => sum + r.result.sessions.length, 0);
-          ctx.ui.notify(
-            `All done! ${completed}/${TOPIC_CATEGORIES.length} completed, ${totalSessions} total rounds.\nMaster summary: ${masterPath}`,
-            'success',
-          );
+          // Build file summary for user
+          const fileSummary = [
+            '✅ Grill session complete!',
+            '',
+            `📊 ${completed}/${TOPIC_CATEGORIES.length} categories, ${totalSessions} rounds`,
+            '',
+            '📁 Your files:',
+            `  PRD checklist: .grill-sessions/project-context.md`,
+            `  Full report:   .grill-sessions/${masterPath.split('/').pop()}`,
+            '',
+            '💡 Tip: Share project-context.md with any LLM to continue building.',
+          ].join('\n');
+
+          ctx.ui.notify(fileSummary, 'success');
 
           // Save master bead
           const beadsAvailable = await hasBeadsDb(ctx.cwd);
@@ -1000,10 +1010,18 @@ export default function grillMeTuiExtension(pi: ExtensionAPI) {
         if (grillResult.cancelled) {
           ctx.ui.notify('Grill session cancelled.', 'warning');
         } else {
-          ctx.ui.notify(
-            `Grill session complete (${grillResult.sessions.length} rounds)\n${grillResult.summary || 'Design sufficiently resolved.'}`,
-            'success',
-          );
+          const fileSummary = [
+            '✅ Grill session complete!',
+            '',
+            `📊 ${grillResult.sessions.length} rounds`,
+            '',
+            '📁 Your files:',
+            `  Sessions: .grill-sessions/ (files for: ${topic})`,
+            '',
+            '💡 Use /grill to continue reviewing, or /grill-new for a new project.',
+          ].join('\n');
+
+          ctx.ui.notify(fileSummary, 'success');
         }
       } catch (err: any) {
         ctx.ui.notify(`Grill failed: ${err.message}`, 'error');
@@ -1112,10 +1130,20 @@ export default function grillMeTuiExtension(pi: ExtensionAPI) {
       const completed = allResults.filter(r => r.result.completed).length;
       const totalSessions = allResults.reduce((sum, r) => sum + r.result.sessions.length, 0);
 
-      ctx.ui.notify(
-        `Done! ${completed}/${selectedCategories.length} completed, ${totalSessions} total rounds.\nPRD: ${prdPath}\nFull: ${masterPath}`,
-        'success',
-      );
+      // Build file summary for user
+      const fileSummary = [
+        '✅ Project grill complete!',
+        '',
+        `📊 ${completed}/${selectedCategories.length} categories, ${totalSessions} rounds`,
+        '',
+        '📁 Your files:',
+        `  PRD checklist: .grill-sessions/project-context.md`,
+        `  Full sessions: .grill-sessions/`,
+        '',
+        '💡 Tip: Give project-context.md to any LLM — it has all decisions + checkboxes.',
+      ].join('\n');
+
+      ctx.ui.notify(fileSummary, 'success');
 
       // Save master bead
       const beadsAvailable = await hasBeadsDb(ctx.cwd);
