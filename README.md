@@ -22,32 +22,47 @@ Generates sharp design questions via LLM, renders them in a TUI questionnaire, p
 
 ## Install
 
-### Global (all projects)
+### Quick install (global)
 
 ```bash
-# Clone into pi extensions directory
-git clone <repo-url> ~/.pi/agent/extensions/grill-me-tui
-
-# Or symlink from your dev folder
-ln -s ~/developer/grill-me-tui ~/.pi/agent/extensions/grill-me-tui
-
-# Reload pi
-/reload
+pi install ~/developer/grill-me-tui
 ```
 
-### Project-local
+### Quick install (project-local)
 
 ```bash
-mkdir -p .pi/extensions
+pi install -l ~/developer/grill-me-tui
+```
+
+### From GitHub (once pushed)
+
+```bash
+pi install git:github.com/ktappdev/grill-me-tui@v1.0.0
+```
+
+### Try without installing
+
+```bash
+pi -e ~/developer/grill-me-tui
+```
+
+### Manual symlink
+
+```bash
+# Global (all projects)
+ln -s ~/developer/grill-me-tui ~/.pi/agent/extensions/grill-me-tui
+
+# Project-local
 ln -s ~/developer/grill-me-tui .pi/extensions/grill-me-tui
 ```
 
-### Via settings.json
+Then `/reload` in pi.
 
-```json
-{
-  "extensions": ["~/developer/grill-me-tui"]
-}
+### Uninstall
+
+```bash
+pi remove ~/developer/grill-me-tui    # global
+pi remove -l ~/developer/grill-me-tui  # project
 ```
 
 ## Prerequisites
