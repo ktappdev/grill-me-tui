@@ -279,9 +279,7 @@ export async function runQuestionnaireUI(
         }
 
         if (matchesKey(data, Key.enter)) {
-          if (areAllAnswersValid(questions, uiState.questionStateById)) {
-            finalize(false);
-          }
+          finalize(false);
           return;
         }
 
@@ -433,7 +431,7 @@ export async function runQuestionnaireUI(
         truncateToWidth(
           ready
             ? theme.fg('success', 'Press Enter to submit')
-            : theme.fg('warning', 'Complete all questions before submitting.'),
+            : theme.fg('warning', 'Enter to submit (partial OK) — Space to edit unanswered'),
           width,
         ),
       );
@@ -445,11 +443,11 @@ export async function runQuestionnaireUI(
       if (uiState.inputMode === 'otherInput') {
         hint = 'Enter submits Other text • Esc exits input mode';
       } else if (uiState.activeTabIndex === reviewTabIndex) {
-        hint = '←→ tabs • ↑↓ review row • Space edit • Enter submit • Esc back';
+        hint = '←→ tabs • ↑↓ review row • Space edit • Enter submit • Esc skip category';
       } else if (uiState.returnToReview) {
         hint = 'Editing from Review • press r to return';
       } else {
-        hint = '←→ tabs • ↑↓ options • Space select/edit • r review • Esc cancel';
+        hint = '←→ tabs • ↑↓ options • Space select • r review • Esc end category (keeps prior rounds)';
       }
 
       lines.push('');

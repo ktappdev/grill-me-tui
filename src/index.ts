@@ -590,13 +590,13 @@ async function runGrillFlow({ ctx, topic, maxRounds, signal }: GrillOrchestrator
 
     summary = generated.summary;
 
-    // Show round results
+    // Show round results with category progress
     const answerSummary = formatExpandedAnswerLines({
       questions,
       answers: uiResult.answers,
       cancelled: false,
     }).join('\n');
-    ctx.ui.notify(`Round ${round + 1} complete:\n${answerSummary}`, 'info');
+    ctx.ui.notify(`${topic}: Round ${round + 1}/${maxRounds}\n${answerSummary}`, 'info');
 
     // Stop if LLM says done
     if (!generated.continue) {
@@ -936,7 +936,7 @@ async function runGrillNewFlow({
       answers: uiResult.answers,
       cancelled: false,
     }).join('\n');
-    ctx.ui.notify(`Round ${round + 1} complete:\n${answerSummary}`, 'info');
+    ctx.ui.notify(`${topic}: Round ${round + 1}/${maxRounds}\n${answerSummary}`, 'info');
 
     if (!generated.continue) {
       break;
@@ -1033,6 +1033,11 @@ export default function grillMeTuiExtension(pi: ExtensionAPI) {
             ctx.ui.setStatus('grill-me', ctx.ui.theme.fg('accent', `🔥 ${cat} [${allResults.length + 1}/${TOPIC_CATEGORIES.length}]`));
             try {
               const result = await runGrillFlow({ ctx, topic: cat, maxRounds, signal: ctx.signal });
+              if (result.cancelled && result.sessions.length === 0) {
+                ctx.ui.notify(`⏭ Skipped: ${cat}`, 'info');
+              } else if (result.cancelled) {
+                ctx.ui.notify(`⏹ Ended early: ${cat} (${result.sessions.length} rounds kept)`, 'info');
+              }
               allResults.push({ topic: cat, result });
             } catch (err: any) {
               ctx.ui.notify(`${cat}: ${err.message}`, 'error');
@@ -1194,6 +1199,11 @@ export default function grillMeTuiExtension(pi: ExtensionAPI) {
             maxRounds,
             signal: ctx.signal,
           });
+          if (result.cancelled && result.sessions.length === 0) {
+            ctx.ui.notify(`⏭ Skipped: ${cat}`, 'info');
+          } else if (result.cancelled) {
+            ctx.ui.notify(`⏹ Ended early: ${cat} (${result.sessions.length} rounds kept)`, 'info');
+          }
           allResults.push({ topic: cat, result });
         } catch (err: any) {
           ctx.ui.notify(`${cat}: ${err.message}`, 'error');
