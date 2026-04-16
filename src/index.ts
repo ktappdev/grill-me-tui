@@ -208,7 +208,103 @@ function formatAnswerValueForMarkdown(answer: NormalizedAnswer): string {
   return '—';
 }
 
-// ─── LLM question generation ────────────────────────────────────────────
+// ─── LLM PRD generation ─────────────────────────────────────────────────
+
+const PRD_PROMPT = `You are a technical writer. Given a project description and grill session Q&A answers, generate a structured PRD checklist in markdown.
+
+Rules:
+- Group related decisions into logical phases (Phase 1, Phase 2, etc.)
+- Each phase has 3-6 checkable items
+- Mark items as [x] if the Q&A resolved them, [ ] if unresolved
+- Include relative links to detailed session files where decisions were made
+- Add an "Open Questions" section for anything that wasn't decided
+- Keep it concise — this is a working checklist, not an essay
+- Use the project description as the overview
+
+Output ONLY the markdown. No code fences, no preamble.
+`;
+
+async function generatePRD(
+  modelRegistry: any,
+  model: any,
+  projectDesc: string,
+  projectType: string,
+  allResults: Array<{ topic: string; result: GrillMeResult }>,
+  signal: AbortSignal,
+): Promise<string> {
+  const auth = await modelRegistry.getApiKeyAndHeaders(model);
+  if (!auth.ok || !auth.apiKey) {
+    // Fallback: simple format without LLM
+    return generateSimplePRD(projectDesc, projectType, allResults);
+  }
+
+  let context = `Project: ${projectDesc}\nType: ${projectType}\n\n`;
+  allResults.forEach((r) => {
+    context += `### ${r.topic}\n`;
+    if (r.result.summary) context += `Summary: ${r.result.summary}\n`;
+    r.result.sessions.forEach((s) => {
+      s.questions.forEach((q, i) => {
+        const a = s.answers[i];
+        const answer = a ? formatAnswerValueForMarkdown(a) : '(unresolved)';
+        context += `- Q: ${q.prompt}\n  A: ${answer}\n`;
+      });
+    });
+    context += '\n';
+  });
+
+  const userMessage: UserMessage = {
+    role: 'user',
+    content: [{ type: 'text', text: context }],
+    timestamp: Date.now(),
+  };
+
+  try {
+    const response = await complete(
+      model,
+      { systemPrompt: PRD_PROMPT, messages: [userMessage] },
+      { apiKey: auth.apiKey, headers: auth.headers, signal },
+    );
+
+    if (response.stopReason === 'aborted') {
+      return generateSimplePRD(projectDesc, projectType, allResults);
+    }
+
+    const text = response.content
+      .filter((c): c is { type: 'text'; text: string } => c.type === 'text')
+      .map((c) => c.text)
+      .join('\n');
+
+    return text.replace(/```(?:markdown)?\n?/g, '').trim();
+  } catch {
+    return generateSimplePRD(projectDesc, projectType, allResults);
+  }
+}
+
+function generateSimplePRD(
+  projectDesc: string,
+  projectType: string,
+  allResults: Array<{ topic: string; result: GrillMeResult }>,
+): string {
+  let md = `# Project: ${projectDesc}\n\n`;
+  md += `**Type:** ${projectType}\n`;
+  md += `**Date:** ${new Date().toISOString().slice(0, 10)}\n`;
+  md += `**Categories grilled:** ${allResults.map(r => r.topic).join(', ')}\n\n`;
+  md += `---\n\n`;
+
+  allResults.forEach((r) => {
+    md += `## ${r.topic}\n\n`;
+    r.result.sessions.forEach((s) => {
+      s.questions.forEach((q, i) => {
+        const a = s.answers[i];
+        const answer = a ? formatAnswerValueForMarkdown(a) : '(unresolved)';
+        md += `- [ ] ${q.prompt}\n  - Answer: ${answer}\n`;
+      });
+    });
+    md += `\n`;
+  });
+
+  return md;
+}
 
 async function generateQuestionsWithLoader(
   uiCtx: any,
@@ -994,27 +1090,32 @@ export default function grillMeTuiExtension(pi: ExtensionAPI) {
       }
       ctx.ui.setStatus('grill-me', undefined);
 
+      // Generate PRD checklist
+      ctx.ui.setStatus('grill-me', ctx.ui.theme.fg('accent', '📝 Generating PRD...'));
+      const prdContent = await generatePRD(
+        ctx.modelRegistry,
+        ctx.model,
+        projectDesc.trim(),
+        projectInfo.type,
+        allResults,
+        new AbortController().signal,
+      );
+
+      // Save PRD checklist
+      const sessionsDir = await ensureGrillSessionsDir(ctx.cwd);
+      const prdPath = join(sessionsDir, 'project-context.md');
+      await writeFile(prdPath, prdContent, 'utf8');
+      ctx.ui.setStatus('grill-me', undefined);
+
       // Save master summary
       const masterPath = await saveAllMarkdown(ctx.cwd, allResults);
       const completed = allResults.filter(r => r.result.completed).length;
       const totalSessions = allResults.reduce((sum, r) => sum + r.result.sessions.length, 0);
 
       ctx.ui.notify(
-        `Done! ${completed}/${selectedCategories.length} completed, ${totalSessions} total rounds.\nMaster: ${masterPath}`,
+        `Done! ${completed}/${selectedCategories.length} completed, ${totalSessions} total rounds.\nPRD: ${prdPath}\nFull: ${masterPath}`,
         'success',
       );
-
-      // Save project context to a file for reference
-      const contextPath = join(ctx.cwd, '.grill-sessions', 'project-context.md');
-      const contextContent = `# Project Context\n\n${projectDesc.trim()}\n\n**Type:** ${projectInfo.type}\n**Structure:** ${projectInfo.structure || 'Empty'}\n\n## Grill Results\n\n${allResults.map(r =>
-        `### ${r.topic}\n\n${r.result.summary || 'No summary'}\n\nRounds: ${r.result.sessions.length}\nStatus: ${r.result.completed ? 'Complete' : 'Incomplete'}\n`
-      ).join('\n---\n\n')}\n`;
-      try {
-        const sessionsDir = await ensureGrillSessionsDir(ctx.cwd);
-        await writeFile(contextPath, contextContent, 'utf8');
-      } catch {
-        // ignore
-      }
 
       // Save master bead
       const beadsAvailable = await hasBeadsDb(ctx.cwd);
@@ -1025,7 +1126,7 @@ export default function grillMeTuiExtension(pi: ExtensionAPI) {
         const masterBeadId = await createGrillBead(
           ctx.cwd,
           `New project: ${projectDesc.trim().slice(0, 50)}`,
-          masterDesc,
+          `PRD: .grill-sessions/project-context.md\n\n${masterDesc}`,
           `${completed}/${selectedCategories.length} completed, ${totalSessions} rounds`,
         );
         if (masterBeadId) {
