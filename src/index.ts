@@ -71,9 +71,7 @@ async function runBd(args: string[], cwd: string): Promise<{ stdout: string; exi
   return new Promise((resolve) => {
     const proc = spawn('bd', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
-    let stderr = '';
     proc.stdout.on('data', (d) => (stdout += d.toString()));
-    proc.stderr.on('data', (d) => (stderr += d.toString()));
     proc.on('close', (code) => resolve({ stdout: stdout.trim(), exitCode: code ?? 1 }));
     proc.on('error', () => resolve({ stdout: '', exitCode: -1 }));
   });
@@ -97,14 +95,12 @@ async function createGrillBead(
       '-l', 'grill-me,design-review',
       '-d', summary,
       '--notes', description,
-      '--context', `Topic: ${topic}`,
       `Grill session: ${topic}`,
     ],
     cwd,
   );
 
   if (result.exitCode === 0) {
-    // bd create outputs the bead ID on first line usually
     const idMatch = result.stdout.match(/([a-z]+-\d+)/i);
     return idMatch ? idMatch[1] : null;
   }
@@ -119,7 +115,6 @@ async function addNoteToBead(cwd: string, beadId: string, note: string): Promise
 // ─── Markdown persistence ───────────────────────────────────────────────
 
 async function ensureGrillSessionsDir(cwd: string): Promise<string> {
-  // Check for .beads dir to find project root, else use cwd
   const sessionsDir = join(cwd, '.grill-sessions');
   try {
     await access(sessionsDir);
@@ -149,12 +144,13 @@ async function saveToMarkdown(
 async function appendToMarkdown(
   cwd: string,
   filepath: string,
+  round: number,
   session: { questions: NormalizedQuestion[]; answers: NormalizedAnswer[]; timestamp: string },
   summary: string,
 ): Promise<void> {
   const existing = await readFile(filepath, 'utf8');
-  const newContent = `\n## Round ${session.questions.length > 0 ? 'N' : ''}\n\n`;
-  let append = `*${session.timestamp}*\n\n`;
+  let append = `\n## Round ${round + 1}\n\n`;
+  append += `*${session.timestamp}*\n\n`;
   session.questions.forEach((q, i) => {
     const answer = session.answers[i];
     const answerText = answer ? formatAnswerValueForMarkdown(answer) : '(no answer)';
@@ -178,13 +174,13 @@ function formatAnswerValueForMarkdown(answer: NormalizedAnswer): string {
 // ─── LLM question generation ────────────────────────────────────────────
 
 async function generateQuestions(
-  ctx: ExtensionAPI,
+  modelRegistry: any,
   model: any,
   topic: string,
   previousSessions: GrillSession[],
   signal: AbortSignal,
 ): Promise<{ questions: QuestionInput[]; continue: boolean; summary: string } | null> {
-  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+  const auth = await modelRegistry.getApiKeyAndHeaders(model);
   if (!auth.ok || !auth.apiKey) {
     throw new Error(auth.ok ? `No API key for ${model.provider}` : auth.error);
   }
@@ -261,7 +257,7 @@ async function runGrillFlow({ ctx, topic, maxRounds }: GrillOrchestratorOptions)
   for (let round = 0; round < maxRounds; round++) {
     // Generate questions via LLM
     const generated = await generateQuestions(
-      ctx.pi,
+      ctx.modelRegistry,
       ctx.model,
       topic,
       sessions,
@@ -326,7 +322,7 @@ async function runGrillFlow({ ctx, topic, maxRounds }: GrillOrchestratorOptions)
     } else {
       // Append to existing markdown
       if (markdownPath) {
-        await appendToMarkdown(ctx.cwd, markdownPath, {
+        await appendToMarkdown(ctx.cwd, markdownPath, round, {
           questions: session.questions,
           answers: session.answers,
           timestamp: session.timestamp,
@@ -377,12 +373,6 @@ async function runGrillFlow({ ctx, topic, maxRounds }: GrillOrchestratorOptions)
 }
 
 // ─── TUI for topic selection ────────────────────────────────────────────
-
-interface TopicSelectorOptions {
-  tui: any;
-  theme: any;
-  done: (result: { topic: string; rounds: number } | null) => void;
-}
 
 class TopicDialog {
   private inputText = '';
